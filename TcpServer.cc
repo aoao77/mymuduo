@@ -1,4 +1,5 @@
 #include "TcpServer.h"
+#include "TcpConnection.h"
 #include "Logger.h"
 
 static EventLoop* CheckLoopNotNull(EventLoop* loop) {
@@ -26,7 +27,14 @@ TcpServer::TcpServer(EventLoop* loop,
     acceptor_->setNewConnectionCallback(std::bind(TcpServer::newConnection, this, std::placeholders::_1, std::placeholders::_2));
 }
 
-TcpServer::~TcpServer();
+TcpServer::~TcpServer() {
+    for(auto& item : connections_) {
+        TcpConnectionPtr conn(item.second);
+        item.second.reset();
+
+        conn->getLoop()->runInLoop(std::bind(&TcpConnection::connectDestroyed(), conn));
+    }
+}
 
 void TcpServer::setThreadNum(int numThread) {
     threadPool_->setThreadNum(numThread);
@@ -40,13 +48,47 @@ void TcpServer::start() {
 }
 
 void TcpServer::newConnection(int sockfd, const InetAddress& peerAddr) {
+    EventLoop* ioloop = threadPool_->getNextLoop();
+    char buf[64] = {0};
+    snprintf(buf, sizeof buf, "-%s#%d", ipPort_.c_str(), nextConnId_);
+    nextConnId_++;
 
+    std::string connName = name_ + buf;
+    LOG_INFO("TcpServer::newConnection [%s] - new connection [%s] from %s \n",
+             name_.c_str(), connName.c_str(), peerAddr.toIpPort().c_str());
+
+    sockaddr_in local;
+    socklen_t localAddrLen = sizeof local;
+    ::bzero(&local, sizeof local);
+    if (::getsockname(sockfd, (sockaddr*)&localAddr, &localAddrLen) < 0) {
+        LOG_ERROR("sockets::getLocalAddr");
+    }
+    InetAddress localAddr(localAddr);
+
+    TcpConnectionPtr conn(new TcpConnection(
+        ioloop,
+        connName,
+        sockfd,
+        localAddr,
+        peerAddr
+    ));
+    connections_[connName] = conn;
+    conn->setConnectionCallback(connectionCallback_); 
+    conn->setMessageCallback(messageCallback_);
+    conn->setWriteCompleteCallback(writeCompleteCallback_);
+    conn->setCloseCallback(std::bind(&TcpServer::removeConnection, this, std::placeholders::_1));
+
+    conn->getLoop()->runInLoop(std::bind(&TcpConnection::connectEstablished, conn));
 }
 
 void TcpServer::removeConnection(const TcpConnectionPtr& conn) {
-
+    conn->getLoop()->runInLoop(std::bind(&TcpServer::removeConnectionInLoop, conn));
 }
 
 void TcpServer::removeConnectionInLoop(const TcpConnectionPtr& conn) {
+    LOG_INFO("TcpServer::removeConnectionInLoop [%s] - connection %s\n",
+             name_.c_str(), conn->name().c_str());
+    connections_.erase(conn->name());
 
+    conn->getLoop()->queueInLoop(std::bind(&TcpConnection::connectDestroyed, conn));
 }
